@@ -361,3 +361,93 @@ class PercentagePropConv(MiotPropConv):
 
 class MiotTargetPositionConv(PercentagePropConv):
     pass
+
+@dataclass
+class MiotBitmaskConv(MiotPropConv):
+    """Text entity for a bitmask uint property.
+
+    ``bits`` is a tuple of ``(label, bit_index)`` pairs in preferred display order.
+    Example for day-of-week:
+        bits=(('Mon',0),('Tue',1),('Wed',2),('Thu',3),('Fri',4),('Sat',5),('Sun',6))
+
+    Decodes integer → "Mon, Wed, Fri" and encodes "Mon, Wed, Fri" → integer.
+    Unknown labels in the encoded string are silently ignored.
+    """
+    bits: tuple = None
+
+    def decode(self, device: 'Device', payload: dict, value):
+        if self.bits is None or not isinstance(value, int):
+            super().decode(device, payload, value)
+            return
+        selected = [lbl for lbl, bit in self.bits if (value >> bit) & 1]
+        BaseConv.decode(self, device, payload, ', '.join(selected))
+
+    def encode(self, device: 'Device', payload: dict, value):
+        if self.bits is None or not isinstance(value, str):
+            super().encode(device, payload, value)
+            return
+        label_to_bit = {lbl.lower(): bit for lbl, bit in self.bits}
+        bitmask = 0
+        for part in value.split(','):
+            key = part.strip().lower()
+            if key in label_to_bit:
+                bitmask |= (1 << label_to_bit[key])
+        super().encode(device, payload, bitmask)
+
+
+@dataclass
+class MiotBitmaskBitConv(BaseConv):
+    """Switch entity for a single bit of a uint bitmask property.
+
+    Extends BaseConv (not MiotPropConv) so that each bit gets its own
+    entity_id derived from ``attr`` (e.g. ``other.repeat.mon``), rather
+    than all bits colliding on the property's generated entity_id.
+
+    Read-modify-write: ``_raw`` caches the full integer from the last
+    decode so that toggling one bit does not clear the others.
+    """
+    prop: 'MiotProperty' = None
+    bit: int = 0
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.prop and not self.mi:
+            from .miot_spec import MiotSpec
+            self.mi = MiotSpec.unique_prop(self.prop.siid, piid=self.prop.iid)
+        self._raw = 0  # instance cache of last seen raw integer
+
+    def decode(self, device: 'Device', payload: dict, value):
+        if isinstance(value, int):
+            self._raw = value
+        BaseConv.decode(self, device, payload, bool((value >> self.bit) & 1) if isinstance(value, int) else None)
+
+    def encode(self, device: 'Device', payload: dict, value):
+        new_val = (self._raw | (1 << self.bit)) if value else (self._raw & ~(1 << self.bit))
+        BaseConv.encode(self, device, payload, int(new_val))
+
+
+@dataclass
+class MiotBitmaskToggleConv(MiotPropConv):
+    """Switch entity for a bitmask property: on = any bit set, off = all bits zero.
+
+    Turning ON restores the last observed non-zero value; if none is known yet,
+    ``default_on`` is written instead.  Turning OFF writes 0.
+    Only useful when the property's value-range minimum is 0.
+    """
+    default_on: int = 0x7F
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._last_nonzero = 0  # instance-level cache
+
+    def decode(self, device: 'Device', payload: dict, value):
+        if isinstance(value, int) and value != 0:
+            self._last_nonzero = value
+        BaseConv.decode(self, device, payload, bool(value) if isinstance(value, int) else None)
+
+    def encode(self, device: 'Device', payload: dict, value):
+        if value:
+            restore = int(self._last_nonzero or self.default_on)
+        else:
+            restore = 0
+        BaseConv.encode(self, device, payload, restore)

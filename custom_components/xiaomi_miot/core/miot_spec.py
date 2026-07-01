@@ -188,6 +188,7 @@ class MiotSpec(MiotSpecInstance):
         eps = kwargs.pop('exclude_properties', [])
         ips = kwargs.pop('include_properties', [])
         urp = kwargs.pop('unreadable_properties', None)
+        gat = kwargs.pop('gatt_properties', False)
         sls = self.get_services(*args, **kwargs)
         if self.custom_mapping:
             sis = list(map(lambda x: x.iid, sls))
@@ -200,7 +201,7 @@ class MiotSpec(MiotSpecInstance):
         for s in sls:
             if dat is None:
                 dat = {}
-            nxt = s.mapping(excludes=eps, includes=ips, unreadable_properties=urp) or {}
+            nxt = s.mapping(excludes=eps, includes=ips, unreadable_properties=urp, gatt_properties=gat) or {}
             dat.update({**nxt, **dat})
         return dat
 
@@ -550,9 +551,11 @@ class MiotService(MiotSpecInstance):
             if not p.full_name:
                 continue
             if not p.readable:
-                if not kwargs.get('unreadable_properties'):
+                if kwargs.get('gatt_properties') and p.gatt_readable:
+                    pass  # gatt-readable: include in BLE GET polling
+                elif not kwargs.get('unreadable_properties'):
                     continue
-                if not p.writeable:
+                elif not p.writeable:
                     continue
             if p.in_list(excludes):
                 continue
@@ -659,6 +662,7 @@ class MiotProperty(MiotSpecInstance):
         self.friendly_name = f'{service.name}.{self.name}'
         self.format = dat.get('format') or ''
         self.access = dat.get('access') or []
+        self.gatt_access = dat.get('gatt-access') or []
         self.unit = dat.get('unit') or ''
         self.value_list = dat.get('value-list') or []
         self.value_range = dat.get('value-range') or []
@@ -755,6 +759,14 @@ class MiotProperty(MiotSpecInstance):
     @property
     def writeable(self):
         return 'write' in self.access
+
+    @property
+    def gatt_readable(self):
+        return 'read' in self.gatt_access
+
+    @property
+    def gatt_writeable(self):
+        return 'write' in self.gatt_access
 
     def generate_entity_id(self, entity, domain=None):
         eid = self.service.spec.generate_entity_id(entity, self.desc_name, domain)

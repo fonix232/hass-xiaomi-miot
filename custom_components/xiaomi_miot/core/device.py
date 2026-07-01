@@ -26,11 +26,13 @@ from .converters import (
     BaseConv, InfoConv, MiotPropConv,
     MiotPropValueConv, MiotActionConv,
     AttrConv, MiotTargetPositionConv, MiotTimePropConv,
+    MiotBitmaskBitConv, MiotBitmaskToggleConv,
 )
 from .coordinator import DataCoordinator
 from .miot_spec import MiotSpec, MiotProperty, MiotResults, MiotResult
 from .miio2miot import Miio2MiotHelper
 from .mini_miio import AsyncMiIO
+from .miot_ble import MiotBleDevice
 from .xiaomi_cloud import MiotCloud, MiCloudException
 from .utils import (
     CustomConfigHelper,
@@ -43,7 +45,7 @@ from .utils import (
 from .templates import template
 
 if TYPE_CHECKING:
-    from . import BasicEntity
+    from . import BasicEntity  # noqa: F401 (used in type annotations)
 
 InfoConverter = InfoConv().with_option(
     icon='mdi:information',
@@ -165,6 +167,7 @@ class Device(CustomConfigHelper):
     spec: Optional['MiotSpec'] = None
     cloud: Optional['MiotCloud'] = None
     local: Optional['MiotDevice'] = None
+    ble: Optional['MiotBleDevice'] = None
     miio2miot: Optional['Miio2MiotHelper'] = None
     available = True
     miot_entity = None
@@ -197,7 +200,14 @@ class Device(CustomConfigHelper):
     async def async_init(self):
         if not self.cloud_only:
             self.local = MiotDevice.from_device(self)
+        # BLE is independent of conn_mode: cloud provides the token, BLE provides transport
+        self.ble = MiotBleDevice.from_device(self)
         spec = await self.get_spec()
+        if spec and self.ble:
+            # Inject the spec so _parse_rsp can use proper signed/float formats
+            self.ble.spec = spec
+            # Forward BLE push-notifications into the standard dispatch path
+            self.ble.on_properties = lambda results: self.dispatch(self.decode(results))
         if spec and self.local and not self.cloud_only:
             self.miio2miot = Miio2MiotHelper.from_model(self.hass, self.model, spec)
             mps = self.custom_config_list('miio_properties')
@@ -225,6 +235,12 @@ class Device(CustomConfigHelper):
     async def async_unload(self):
         for coo in self.coordinators:
             await coo.async_shutdown()
+
+        if self.ble:
+            try:
+                await self.ble.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
 
         self.spec = None
         self.hass.data[DOMAIN].setdefault('miot_specs', {}).pop(self.model, None)
@@ -504,6 +520,36 @@ class Device(CustomConfigHelper):
             for attr in self.custom_config_list(f'{d}_attributes') or []:
                 self.add_converter(AttrConv(attr, d))
 
+        # bitmask_properties: dict of {prop_name: 'Label0,Label1,...'}
+        # Creates one switch entity per bit plus, when range_min==0, a master
+        # on/off toggle that restores the last non-zero value on turn-on.
+        bitmask_cfg = self.custom_config_json('bitmask_properties') or {}
+        for prop_name, labels_csv in bitmask_cfg.items():
+            bm_props = self.spec.get_properties(prop_name)
+            if not bm_props:
+                self.log.warning('bitmask_properties: property %s not found', prop_name)
+                continue
+            bm_prop = bm_props[0]
+            labels = [lbl.strip() for lbl in labels_csv.split(',')]
+            # One switch per bit
+            for bit, label in enumerate(labels):
+                safe = label.replace(':', '_').replace(' ', '_').lower()
+                bit_conv = MiotBitmaskBitConv(
+                    f'{bm_prop.full_name}.{safe}', 'switch',
+                    prop=bm_prop, bit=bit,
+                )
+                bit_conv.with_option(name=label)
+                self.add_converter(bit_conv)
+            # Master toggle: only when 0 is a valid value (range_min == 0)
+            if bm_prop.range_min() == 0:
+                default_on = (1 << len(labels)) - 1
+                toggle_conv = MiotBitmaskToggleConv(
+                    f'{bm_prop.full_name}.enabled', 'switch',
+                    prop=bm_prop, default_on=default_on,
+                )
+                toggle_conv.with_option(name='Timer')
+                self.add_converter(toggle_conv)
+
     async def init_coordinators(self):
         if dby := self.hass_device_disabled:
             self.log.debug('Device disabled by: %s', dby)
@@ -754,6 +800,19 @@ class Device(CustomConfigHelper):
         return result
 
     @property
+    def use_ble(self):
+        """Use the direct GATT BLE transport (mible V2).
+
+        Cloud may still be active for device discovery, token retrieval and
+        MIoT spec download — BLE only replaces the property read/write path.
+        """
+        if not self.ble:
+            return False
+        if self.custom_config_bool('miot_ble'):
+            return True
+        return False
+
+    @property
     def use_local(self):
         if self.cloud_only:
             return False
@@ -815,6 +874,7 @@ class Device(CustomConfigHelper):
             excludes=self._exclude_miot_services,
             exclude_properties=self._exclude_miot_properties,
             unreadable_properties=self._unreadable_properties,
+            gatt_properties=self.use_ble,
         ) or {}
         self._miot_mapping = mapping
         return mapping
@@ -832,10 +892,17 @@ class Device(CustomConfigHelper):
         results = []
         self.miot_results = MiotResults()
 
-        if use_local is None:
-            use_local = False if use_cloud else self.use_local
-        if use_cloud is None:
-            use_cloud = False if use_local else self.use_cloud
+        use_ble = self.use_ble
+        if use_ble:
+            # BLE is the transport: suppress WiFi-local and cloud property polling.
+            # Cloud is still used elsewhere for token/spec retrieval.
+            use_local = False
+            use_cloud = False
+        else:
+            if use_local is None:
+                use_local = False if use_cloud else self.use_local
+            if use_cloud is None:
+                use_cloud = False if use_local else self.use_cloud
         if auto_cloud is None:
             auto_cloud = self.auto_cloud
         if check_lan is None:
@@ -850,8 +917,27 @@ class Device(CustomConfigHelper):
         self.log.debug('Update miot status: %s', {
             'use_local': [use_local, self.use_local, self.local],
             'use_cloud': [use_cloud, self.use_cloud, self.auto_cloud],
+            'use_ble':   [use_ble,   self.use_ble,   self.ble],
             'mapping': mapping,
         })
+
+        if use_ble:
+            try:
+                if not self.ble.is_connected:
+                    await self.ble.connect()
+                results = await self.ble.async_get_properties_for_mapping(
+                    did=self.did,
+                    mapping=mapping,
+                )
+                self.available = True
+                self.miot_results.updater = 'ble'
+                self.miot_results.set_results(results, mapping)
+            except Exception as exc:
+                self.log.warning(
+                    '%s: BLE update failed: %s', self.name, exc
+                )
+                self.miot_results.errors = exc
+                self.available = False
 
         if use_local:
             try:
@@ -1026,7 +1112,11 @@ class Device(CustomConfigHelper):
             return {'error': 'Mapping error'}
         try:
             results = []
-            if self.use_local and self._local_state:
+            if self.use_ble and self.ble:
+                if not self.ble.is_connected:
+                    await self.ble.connect()
+                results = await self.ble.async_get_properties_for_mapping(did=self.did, mapping=mapping)
+            elif self.use_local and self._local_state:
                 results = await self.local.async_get_properties_for_mapping(did=self.did, mapping=mapping)
             elif self.cloud:
                 results = await self.cloud.async_get_properties_for_mapping(self.did, mapping)
@@ -1048,6 +1138,10 @@ class Device(CustomConfigHelper):
         results = []
         cloud_params = []
         cloud_write = self.cloud and self.custom_config_bool('miot_cloud_write')
+        if self.use_ble and self.ble:
+            if not self.ble.is_connected:
+                await self.ble.connect()
+            return await self.ble.async_send('set_properties', params)
         if not self._local_state or self.cloud_only or cloud_write:
             cloud_params = params
         elif self.miio2miot:

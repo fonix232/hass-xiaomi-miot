@@ -138,6 +138,8 @@ class XEntity(BasicEntity):
             self.entity_id = device.spec.generate_entity_id(self, conv.attr, conv.domain)
             # self._attr_name = conv.attr.replace('_', '').title()
             self._attr_translation_key = conv.attr
+            if name := conv.option.get('name'):
+                self._attr_name = name
             if isinstance(conv, InfoConv):
                 self._attr_available = True
 
