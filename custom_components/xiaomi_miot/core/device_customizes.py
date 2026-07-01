@@ -1863,6 +1863,22 @@ DEVICE_CUSTOMIZES = {
         },
         'exclude_miot_properties': 'unixtime',  # PIID=8 — written by connect() for clock sync
     },
+    # V-series diffuser — identical spec except no temperature sensor (SIID=3 PIID=9).
+    # (urn:miot-spec-v2:device:diffuser:0000A01E:szxzh-v03:1)
+    'szxzh.diffuser.v03': {
+        'miot_ble': True,
+        'switch_properties': 'status',
+        'sensor_properties': 'battery_level,charging_status',
+        'number_properties': 'fragrance_out_time,idle_time',
+        # auto_power_on: PIID=5 uint16, bits 0-11 = 2-hr slots 00:00–22:00 (min=1, so 0 invalid)
+        # repeat:        PIID=7 uint8,  bits 0-6  = Mon–Sun             (0 = timer disabled)
+        'bitmask_properties': {
+            'auto_power_on': '00:00,02:00,04:00,06:00,08:00,10:00,12:00,14:00,16:00,18:00,20:00,22:00',
+            'repeat': 'Mon,Tue,Wed,Thu,Fri,Sat,Sun',
+        },
+        'exclude_miot_properties': 'unix_time',
+    },
+
     'tmwl.valve.iotb2': {
         'sensor_attributes': 'current_power,current_voltage,current_current,leakage_current,*_temperature',
         'switch_properties': 'valve_switch',
