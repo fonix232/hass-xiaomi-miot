@@ -51,8 +51,9 @@ _CHAR_RX   = "0000001b-0000-1000-8000-00805f9b34fb"  # RX   (encrypted dev→app
 _CHAR_INFO = "0000001c-0000-1000-8000-00805f9b34fb"  # Info (firmware / model)
 
 # ── Timeouts ──────────────────────────────────────────────────────────────────
-_HANDSHAKE_TIMEOUT = 10.0  # seconds per handshake exchange step
-_STATE_TIMEOUT     = 5.0   # seconds to wait for a properties response
+_HANDSHAKE_TIMEOUT    = 10.0  # seconds per handshake exchange step
+_STATE_TIMEOUT        = 5.0   # seconds to wait for a properties response
+_WRITE_SUPPRESS_SECS  = 5.0   # suppress push-report reverts for this long after a write
 
 # ── HKDF / CCM parameters ─────────────────────────────────────────────────────
 _HKDF_INFO    = b"mible-login-info"
@@ -344,6 +345,11 @@ class MiotBleDevice:
         # Decoded property responses (get_properties_rsp + property_report)
         self._rx_queue: asyncio.Queue[list[dict]] = asyncio.Queue()
 
+        # Recently-written properties: (siid, piid) → monotonic expiry time.
+        # Push-notification updates for these keys are suppressed until expiry
+        # so that ~1 Hz property_reports don't revert optimistic state updates.
+        self._pending_writes: dict[tuple[int, int], float] = {}
+
         # Prevents concurrent connect() calls from racing each other
         self._connect_lock = asyncio.Lock()
 
@@ -436,6 +442,11 @@ class MiotBleDevice:
 
         payload = _build_set_properties_payload(self._fc, prop_records)
         await self._send_encrypted(payload)  # increments self._fc
+
+        # Suppress incoming property_report reverts for these properties.
+        expiry = time.monotonic() + _WRITE_SUPPRESS_SECS
+        for p in params:
+            self._pending_writes[(p["siid"], p["piid"])] = expiry
 
         # The device acknowledges set_properties asynchronously via RX; return
         # a synthetic success result so callers see no error immediately.
@@ -697,7 +708,19 @@ class MiotBleDevice:
             if results:
                 self._rx_queue.put_nowait(results)
                 if self.on_properties is not None:
-                    self.on_properties(results)
+                    # Don't let ~1 Hz push reports revert optimistic writes.
+                    # Filter out any property that was written within the
+                    # suppression window; expire stale entries while we're here.
+                    now = time.monotonic()
+                    self._pending_writes = {
+                        k: v for k, v in self._pending_writes.items() if v > now
+                    }
+                    push = [
+                        r for r in results
+                        if (r["siid"], r["piid"]) not in self._pending_writes
+                    ]
+                    if push:
+                        self.on_properties(push)
         elif opcode == 0x01:
             self._log_set_rsp(plaintext)
 
