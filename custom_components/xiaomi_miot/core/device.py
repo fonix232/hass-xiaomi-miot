@@ -26,7 +26,7 @@ from .converters import (
     BaseConv, InfoConv, MiotPropConv,
     MiotPropValueConv, MiotActionConv,
     AttrConv, MiotTargetPositionConv, MiotTimePropConv,
-    MiotBitmaskBitConv, MiotBitmaskToggleConv,
+    MiotBitmaskBitConv, MiotBitmaskToggleConv, _BitmaskPropState,
 )
 from .coordinator import DataCoordinator
 from .miot_spec import MiotSpec, MiotProperty, MiotResults, MiotResult
@@ -531,6 +531,7 @@ class Device(CustomConfigHelper):
                 continue
             bm_prop = bm_props[0]
             labels = [lbl.strip() for lbl in labels_csv.split(',')]
+            shared_state = _BitmaskPropState()
             # One switch per bit
             for bit, label in enumerate(labels):
                 safe = label.replace(':', '_').replace(' ', '_').lower()
@@ -538,6 +539,7 @@ class Device(CustomConfigHelper):
                     f'{bm_prop.full_name}.{safe}', 'switch',
                     prop=bm_prop, bit=bit,
                 )
+                bit_conv._state = shared_state
                 bit_conv.with_option(name=label)
                 self.add_converter(bit_conv)
             # Master toggle: only when 0 is a valid value (range_min == 0)

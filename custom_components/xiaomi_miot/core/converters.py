@@ -1,5 +1,7 @@
+import asyncio
 from typing import TYPE_CHECKING, Any
 from dataclasses import dataclass
+from homeassistant.helpers.event import async_call_later
 from homeassistant.util import color, percentage
 
 if TYPE_CHECKING:
@@ -362,6 +364,33 @@ class PercentagePropConv(MiotPropConv):
 class MiotTargetPositionConv(PercentagePropConv):
     pass
 
+class _BitmaskPropState:
+    """Shared mutable state for all MiotBitmaskBitConv instances of one property.
+
+    Rapid successive bit toggles accumulate in ``raw`` and are flushed to the
+    device in a single write after the debounce window closes.
+    """
+    __slots__ = ('raw', '_cancel')
+
+    def __init__(self) -> None:
+        self.raw: int = 0
+        self._cancel = None
+
+    def schedule_write(self, hass, delay_s: float, coro_factory) -> None:
+        """(Re)schedule a deferred write, cancelling any previous pending one."""
+        from homeassistant.core import callback as ha_callback
+        if self._cancel is not None:
+            self._cancel()
+            self._cancel = None
+
+        @ha_callback
+        def _fire(_now):
+            self._cancel = None
+            asyncio.ensure_future(coro_factory())
+
+        self._cancel = async_call_later(hass, delay_s, _fire)
+
+
 @dataclass
 class MiotBitmaskConv(MiotPropConv):
     """Text entity for a bitmask uint property.
@@ -399,12 +428,8 @@ class MiotBitmaskConv(MiotPropConv):
 class MiotBitmaskBitConv(BaseConv):
     """Switch entity for a single bit of a uint bitmask property.
 
-    Extends BaseConv (not MiotPropConv) so that each bit gets its own
-    entity_id derived from ``attr`` (e.g. ``other.repeat.mon``), rather
-    than all bits colliding on the property's generated entity_id.
-
-    Read-modify-write: ``_raw`` caches the full integer from the last
-    decode so that toggling one bit does not clear the others.
+    All bit-converters for the same property share a ``_BitmaskPropState`` so
+    that rapid successive toggles coalesce into a single deferred write.
     """
     prop: 'MiotProperty' = None
     bit: int = 0
@@ -414,16 +439,30 @@ class MiotBitmaskBitConv(BaseConv):
         if self.prop and not self.mi:
             from .miot_spec import MiotSpec
             self.mi = MiotSpec.unique_prop(self.prop.siid, piid=self.prop.iid)
-        self._raw = 0  # instance cache of last seen raw integer
+        self._state = _BitmaskPropState()
 
     def decode(self, device: 'Device', payload: dict, value):
         if isinstance(value, int):
-            self._raw = value
+            self._state.raw = value
         BaseConv.decode(self, device, payload, bool((value >> self.bit) & 1) if isinstance(value, int) else None)
 
     def encode(self, device: 'Device', payload: dict, value):
-        new_val = (self._raw | (1 << self.bit)) if value else (self._raw & ~(1 << self.bit))
-        BaseConv.encode(self, device, payload, int(new_val))
+        new_val = (self._state.raw | (1 << self.bit)) if value else (self._state.raw & ~(1 << self.bit))
+        self._state.raw = new_val
+
+        async def _write():
+            result = await device.async_set_properties([{
+                'siid': self.prop.siid,
+                'piid': self.prop.iid,
+                'did': device.did,
+                'value': self._state.raw,
+            }])
+            device.log.info(
+                'bitmask write %s=0x%x result=%s', self.prop.name, self._state.raw, result,
+            )
+
+        self._state.schedule_write(device.hass, 0.3, _write)
+        # Don't put anything in the outer payload — the deferred task handles the write.
 
 
 @dataclass
